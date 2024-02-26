@@ -12,13 +12,14 @@
 
 #![allow(clippy::borrow_as_ptr, clippy::redundant_closure)]
 
-use std::cmp;
 use std::cmp::Ordering;
+use std::cmp::{self, max};
 use std::collections::BTreeMap;
 
 use std::fs::File;
 use std::io::prelude::*;
 use std::io::{BufReader, BufWriter};
+use std::iter::zip;
 use std::str;
 
 use hashbrown::{HashMap, HashSet};
@@ -26,7 +27,7 @@ use indexmap::IndexSet;
 
 use rustworkx_core::dictmap::*;
 
-use pyo3::exceptions::PyIndexError;
+use pyo3::exceptions::{PyIndexError, PyTypeError};
 use pyo3::gc::PyVisit;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyList, PyString, PyTuple};
@@ -36,7 +37,7 @@ use pyo3::Python;
 use ndarray::prelude::*;
 use num_traits::Zero;
 use numpy::Complex64;
-use numpy::PyReadonlyArray2;
+use numpy::{PyReadonlyArray1, PyReadonlyArray2};
 
 use petgraph::algo;
 use petgraph::graph::{EdgeIndex, NodeIndex};
@@ -2887,7 +2888,7 @@ impl PyDiGraph {
     /// required to return a boolean value stating whether the node's data payload fits some criteria.
     ///
     /// For example::
-    ///     
+    ///
     ///     from rustworkx import PyDiGraph
     ///
     ///     graph = PyDiGraph()
@@ -2935,8 +2936,8 @@ impl PyDiGraph {
     ///     def my_filter_function(edge):
     ///         if edge:
     ///             return edge == 'B'
-    ///         return False  
-    ///        
+    ///         return False
+    ///
     ///     indices = graph.filter_edges(my_filter_function)
     ///     assert indices == [1]
     ///
@@ -3050,6 +3051,99 @@ fn weight_transform_callable(
             Ok(res.to_object(py))
         }
         None => Ok(value.clone_ref(py)),
+    }
+}
+
+fn _from_sparse_adjacency_matrix<'p, T>(
+    py: Python<'p>,
+    edge_tuples: (
+        PyReadonlyArray1<'p, usize>,
+        PyReadonlyArray1<'p, usize>,
+        Option<PyReadonlyArray1<'p, T>>,
+    ),
+    auto_contract: bool,
+    size: Option<usize>,
+    node_payload: Option<PyReadonlyArray1<T>>,
+) -> PyResult<PyDiGraph>
+where
+    T: Copy + std::cmp::PartialEq + numpy::Element + pyo3::ToPyObject + IsNan,
+{
+    let coordinates = zip(
+        edge_tuples.0.as_array().iter().copied(),
+        edge_tuples.1.as_array().iter().copied(),
+    )
+    .collect::<Vec<(usize, usize)>>()
+    .sort_by(|x, y| x.0.cmp(&y.0));
+
+    let mut out_graph = StablePyGraph::<Directed>::new();
+    let node_count = match (size, auto_contract) {
+        (Some(x), false) => Ok(x),
+        (None, false) => Err(PyTypeError::new_err(
+            "please set either auto_contract=True or a size",
+        )),
+        (_, true) => max(
+            row.iter().max_by(|x, y| (**x).cmp(*y)),
+            row.iter().max_by(|x, y| (**x).cmp(*y)),
+        )
+        .copied()
+        .ok_or(PyIndexError::new_err("please provide valid edge data")),
+    }?;
+
+    for node_index in 0..node_count {
+        out_graph.add_node(match node_payload {
+            Some(x) => x
+                .get(node_index)
+                .ok_or(PyIndexError::new_err("Index for node_data out of range"))?
+                .to_object(py),
+            None => py.None(),
+        });
+    }
+
+    match (edge_tuples.2, fill_value) {
+        (Some(_), Some(_)) => Err(PyTypeError::new_err(
+            "Too many arguments. Either input a data column or a null_and_fill_value",
+        )),
+        (None, None) => Err(PyTypeError::new_err(
+            "Too few arguments. Either input a data column or a null_and_fill_value",
+        )),
+        (Some(data), None) => {
+            let coordinates_with_data = zip(coordinates, data.as_array());
+
+            for ((row, column), data_element) in coordinates_with_data {
+                out_graph.add_edge(
+                    NodeIndex::new(*row),
+                    NodeIndex::new(*column),
+                    data_element.to_object(py),
+                );
+            }
+
+            Ok(PyDiGraph {
+                graph: out_graph,
+                cycle_state: algo::DfsSpace::default(),
+                check_cycle: false,
+                node_removed: false,
+                multigraph: true,
+                attrs: py.None(),
+            })
+        }
+        (None, Some(fill_value)) => {
+            for (row, column) in coordinates {
+                out_graph.add_edge(
+                    NodeIndex::new(*row),
+                    NodeIndex::new(*column),
+                    fill_value.to_object(py),
+                );
+            }
+
+            Ok(PyDiGraph {
+                graph: out_graph,
+                cycle_state: algo::DfsSpace::default(),
+                check_cycle: false,
+                node_removed: false,
+                multigraph: true,
+                attrs: py.None(),
+            })
+        }
     }
 }
 
