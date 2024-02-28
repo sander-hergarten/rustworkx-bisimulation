@@ -3069,7 +3069,6 @@ fn _from_sparse_adjacency_matrix<'p>(
     edge_tuples: (PyReadonlyArray1<'p, usize>, PyReadonlyArray1<'p, usize>),
     max_val: usize,
 ) -> PyDiGraph {
-    use std::time::Instant;
     let coordinates = zip(
         edge_tuples.0.as_array().into_iter().copied(),
         edge_tuples.1.as_array().into_iter().copied(),
